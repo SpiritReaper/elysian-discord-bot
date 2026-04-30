@@ -60,6 +60,8 @@ class ElysianLauncher(ctk.CTk):
             ("Stop Local Bot", self.stop_bot),
             ("Restart Local Bot", self.restart_bot),
             ("Push Updates to GitHub", self.update_code),
+            ("Git Status", self.git_status),
+            ("Abort Git Conflict", self.abort_git_conflict),
             ("Update Packages", self.update_packages),
             ("Python Version", self.check_python),
             ("Clear Logs", self.clear_logs),
@@ -70,7 +72,7 @@ class ElysianLauncher(ctk.CTk):
                 self.sidebar,
                 text=text,
                 command=cmd
-            ).pack(fill="x", padx=20, pady=6)
+            ).pack(fill="x", padx=20, pady=5)
 
     def build_dashboard(self):
         self.status_badge = ctk.CTkLabel(
@@ -92,25 +94,25 @@ class ElysianLauncher(ctk.CTk):
             self.bottom_status_frame,
             text="Local Status: Stopped"
         )
-        self.local_status_label.grid(row=0, column=0, padx=20)
+        self.local_status_label.grid(row=0, column=0, padx=18)
 
         self.local_uptime_label = ctk.CTkLabel(
             self.bottom_status_frame,
             text="Local Uptime: 00:00:00"
         )
-        self.local_uptime_label.grid(row=0, column=1, padx=20)
+        self.local_uptime_label.grid(row=0, column=1, padx=18)
 
         self.railway_status_label = ctk.CTkLabel(
             self.bottom_status_frame,
             text="Railway Status: Unknown"
         )
-        self.railway_status_label.grid(row=0, column=2, padx=20)
+        self.railway_status_label.grid(row=0, column=2, padx=18)
 
         self.railway_uptime_label = ctk.CTkLabel(
             self.bottom_status_frame,
             text="Railway Runtime: Unknown"
         )
-        self.railway_uptime_label.grid(row=0, column=3, padx=20)
+        self.railway_uptime_label.grid(row=0, column=3, padx=18)
 
     def log(self, msg):
         self.log_box.insert("end", msg + "\n")
@@ -119,6 +121,118 @@ class ElysianLauncher(ctk.CTk):
     def clear_logs(self):
         self.log_box.delete("1.0", "end")
         self.remote_info.delete("1.0", "end")
+
+    def run_command(self, command, allow_fail=False):
+        self.log(f"Running: {' '.join(command)}")
+
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+
+        output = result.stdout.strip() if result.stdout else ""
+
+        if output:
+            self.log(output)
+
+        if result.returncode != 0 and not allow_fail:
+            raise Exception(f"Command failed: {' '.join(command)}")
+
+        return result
+
+    def git_status(self):
+        self.log("Checking Git status...")
+
+        try:
+            self.run_command(["git", "status"])
+            self.run_command(["git", "remote", "-v"])
+        except Exception as e:
+            self.log(f"Git status failed: {e}")
+
+    def abort_git_conflict(self):
+        self.log("Attempting to abort active Git conflict/rebase...")
+
+        self.run_command(["git", "rebase", "--abort"], allow_fail=True)
+        self.run_command(["git", "merge", "--abort"], allow_fail=True)
+
+        self.log("Git conflict abort attempted. Run Git Status to confirm.")
+
+    def ensure_gitignore_protection(self):
+        gitignore_path = ".gitignore"
+
+        existing = ""
+        if os.path.exists(gitignore_path):
+            with open(gitignore_path, "r", encoding="utf-8") as file:
+                existing = file.read()
+
+        needed_lines = [".env", "__pycache__/", "*.pyc"]
+        changed = False
+
+        for line in needed_lines:
+            if line not in existing:
+                existing += f"\n{line}"
+                changed = True
+
+        if changed:
+            with open(gitignore_path, "w", encoding="utf-8") as file:
+                file.write(existing.strip() + "\n")
+
+            self.log(".gitignore updated with safe defaults.")
+
+        self.run_command(["git", "rm", "--cached", ".env"], allow_fail=True)
+
+    def update_code(self):
+        self.log("Pushing updates to GitHub...")
+
+        try:
+            self.ensure_gitignore_protection()
+
+            status_result = self.run_command(
+                ["git", "status", "--porcelain"],
+                allow_fail=True
+            )
+
+            self.run_command(["git", "add", "."])
+
+            commit_result = self.run_command(
+                ["git", "commit", "-m", "Update bot"],
+                allow_fail=True
+            )
+
+            if commit_result.returncode != 0:
+                self.log("No new local commit was created. Continuing sync anyway.")
+
+            pull_result = self.run_command(
+                ["git", "pull", "--rebase", "origin", "main"],
+                allow_fail=True
+            )
+
+            if pull_result.returncode != 0:
+                self.log("")
+                self.log("Git pull/rebase failed.")
+                self.log("This usually means there is a conflict that needs manual review.")
+                self.log("Click 'Abort Git Conflict' if you want to cancel the rebase.")
+                self.log("Then manually resolve bot.py if needed before pushing again.")
+                return
+
+            push_result = self.run_command(
+                ["git", "push", "origin", "main"],
+                allow_fail=True
+            )
+
+            if push_result.returncode != 0:
+                self.log("")
+                self.log("Push failed.")
+                self.log("Most common reason: GitHub has newer changes or secret scanning blocked the push.")
+                self.log("Run Git Status, then try Push Updates again.")
+                return
+
+            self.log("Push successful. Railway will automatically redeploy.")
+
+        except Exception as e:
+            self.log(f"Push failed: {e}")
 
     def start_bot(self):
         if self.process and self.process.poll() is None:
@@ -187,46 +301,6 @@ class ElysianLauncher(ctk.CTk):
             self.local_uptime_label.configure(text="Local Uptime: 00:00:00")
 
         self.after(1000, self.update_local_uptime)
-
-    def run_command(self, command, allow_fail=False):
-        self.log(f"Running: {' '.join(command)}")
-
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
-
-        if result.stdout:
-            self.log(result.stdout.strip())
-
-        if result.returncode != 0 and not allow_fail:
-            raise Exception(f"Command failed: {' '.join(command)}")
-
-        return result
-
-    def update_code(self):
-        self.log("Pushing updates to GitHub...")
-
-        try:
-            self.run_command(["git", "add", "."])
-
-            commit_result = self.run_command(
-                ["git", "commit", "-m", "Update bot"],
-                allow_fail=True
-            )
-
-            if commit_result.returncode != 0:
-                self.log("No new changes to commit. Pushing anyway.")
-
-            self.run_command(["git", "pull", "--rebase", "origin", "main"], allow_fail=True)
-            self.run_command(["git", "push", "origin", "main"])
-
-            self.log("Push successful. Railway will automatically redeploy.")
-
-        except Exception as e:
-            self.log(f"Push failed: {e}")
 
     def check_health(self):
         self.log("Checking remote health...")
