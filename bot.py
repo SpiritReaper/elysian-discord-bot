@@ -71,6 +71,10 @@ def add_event(message):
 
 
 def atomic_write_json(path, data):
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as file:
         json.dump(data, file, indent=4)
@@ -172,6 +176,50 @@ def first_non_bot_member(channel):
     return None
 
 
+async def recover_setup_from_discord():
+    """Recover Form a Party setup after Railway redeploys.
+
+    If CONFIG_FILE is missing, empty, or points to deleted channels, this scans Discord
+    by name and saves the correct category_id and join_channel_id back to persistent
+    storage. This prevents needing /setup after every redeploy.
+    """
+    config = await load_config()
+    changed = False
+
+    for guild in bot.guilds:
+        guild_key = str(guild.id)
+        guild_config = config.get(guild_key, {})
+
+        category_id = guild_config.get("category_id")
+        join_channel_id = guild_config.get("join_channel_id")
+
+        category = guild.get_channel(category_id) if category_id else None
+        join_channel = guild.get_channel(join_channel_id) if join_channel_id else None
+
+        if category and join_channel:
+            continue
+
+        category = discord.utils.get(guild.categories, name=CATEGORY_NAME)
+        if not category:
+            continue
+
+        join_channel = discord.utils.get(category.voice_channels, name=JOIN_CHANNEL_NAME)
+        if not join_channel:
+            continue
+
+        config[guild_key] = {
+            "category_id": category.id,
+            "join_channel_id": join_channel.id,
+        }
+        changed = True
+        add_event(f"Recovered setup from Discord in {guild.name}")
+
+    if changed:
+        await save_config(config)
+
+    return config
+
+
 async def restore_temporary_channels():
     """Rebuild temporary channel ownership after Railway restarts/redeploys.
 
@@ -189,7 +237,7 @@ async def restore_temporary_channels():
 
     async with restore_lock:
         await load_state()
-        config = await load_config()
+        config = await recover_setup_from_discord()
 
         restored = 0
         adopted = 0
@@ -490,6 +538,10 @@ async def on_voice_state_update(member, before, after):
     try:
         config = await load_config()
         guild_config = config.get(str(member.guild.id))
+
+        if not guild_config:
+            config = await recover_setup_from_discord()
+            guild_config = config.get(str(member.guild.id))
 
         if not guild_config:
             return
