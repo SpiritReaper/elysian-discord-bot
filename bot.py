@@ -464,21 +464,69 @@ async def setup(interaction: discord.Interaction):
 
 @bot.tree.command(name="lock", description="Lock your temporary voice channel")
 async def lock(interaction: discord.Interaction):
-    if not user_owns_channel(interaction):
-        await interaction.response.send_message(
-            "You can only lock a temporary voice channel that you created.",
+    # Defer immediately so Discord does not show "The application did not respond"
+    # while permissions/state saving are being processed.
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.followup.send(
+                "You need to be inside your temporary voice channel to lock it.",
+                ephemeral=True,
+            )
+            return
+
+        channel = interaction.user.voice.channel
+
+        # Safety recovery: if this channel exists in the Form a Party category but was not
+        # tracked after a reconnect/redeploy, adopt it for the user running /lock.
+        if channel.id not in temporary_channels:
+            config = await load_config()
+            guild_config = config.get(str(interaction.guild.id))
+
+            if not guild_config:
+                config = await recover_setup_from_discord()
+                guild_config = config.get(str(interaction.guild.id))
+
+            category_id = guild_config.get("category_id") if guild_config else None
+            join_channel_id = guild_config.get("join_channel_id") if guild_config else None
+
+            if channel.category and channel.category.id == category_id and channel.id != join_channel_id:
+                temporary_channels[channel.id] = interaction.user.id
+                await save_state()
+                add_event(f"Auto-adopted {channel.name} for {interaction.user} during /lock")
+
+        if temporary_channels.get(channel.id) != interaction.user.id:
+            await interaction.followup.send(
+                "You can only lock a temporary voice channel that you created.",
+                ephemeral=True,
+            )
+            return
+
+        everyone = interaction.guild.default_role
+
+        await channel.set_permissions(everyone, connect=False)
+        await channel.set_permissions(interaction.user, connect=True)
+        add_event(f"{interaction.user} locked {channel.name}")
+
+        await interaction.followup.send(
+            f"Locked **{channel.name}**.",
             ephemeral=True,
         )
-        return
 
-    channel = interaction.user.voice.channel
-    everyone = interaction.guild.default_role
+    except discord.Forbidden:
+        add_error("Missing permission while trying to lock channel")
+        await interaction.followup.send(
+            "I do not have permission to lock this channel. Make sure my bot role has Manage Channels and is high enough in the role list.",
+            ephemeral=True,
+        )
 
-    await channel.set_permissions(everyone, connect=False)
-    await channel.set_permissions(interaction.user, connect=True)
-    add_event(f"{interaction.user} locked {channel.name}")
-
-    await interaction.response.send_message(f"Locked **{channel.name}**.", ephemeral=True)
+    except Exception as e:
+        add_error(e)
+        await interaction.followup.send(
+            f"Lock failed: {e}",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(name="unlock", description="Unlock your temporary voice channel")
