@@ -16,11 +16,17 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 STATS_API_KEY = os.getenv("STATS_API_KEY", "")
 PORT = int(os.environ.get("PORT", 8080))
 
-CONFIG_FILE = "config.json"
-STATE_FILE = "elysian_state.json"
+CONFIG_FILE = os.getenv("CONFIG_FILE", "config.json")
+STATE_FILE = os.getenv("STATE_FILE", "elysian_state.json")
 
 CATEGORY_NAME = "Form a Party"
 JOIN_CHANNEL_NAME = "New Party"
+
+# If true, empty temp channels found after startup/redeploy are removed.
+# This keeps old orphaned temp channels from breaking the Form a Party category.
+CLEAN_EMPTY_TEMP_CHANNELS_ON_STARTUP = os.getenv(
+    "CLEAN_EMPTY_TEMP_CHANNELS_ON_STARTUP", "true"
+).lower() in ("1", "true", "yes", "y")
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -29,7 +35,7 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # channel_id -> owner_id
-# This is restored from disk on startup so temporary channels still work after Railway redeploys.
+# This is saved during runtime and rebuilt from Discord after Railway redeploys.
 temporary_channels = {}
 bot_start_time = datetime.now(pytz.utc)
 total_temp_channels_created = 0
@@ -41,6 +47,7 @@ rate_limit_hits = {}
 
 state_lock = asyncio.Lock()
 config_lock = asyncio.Lock()
+restore_lock = asyncio.Lock()
 
 
 def utc_now():
@@ -109,11 +116,11 @@ async def save_state():
     async with state_lock:
         state = {
             "temporary_channels": {
-                str(channel_id): owner_id
+                str(channel_id): int(owner_id)
                 for channel_id, owner_id in temporary_channels.items()
             },
-            "total_temp_channels_created": total_temp_channels_created,
-            "saved_at_utc": now_string()
+            "total_temp_channels_created": int(total_temp_channels_created),
+            "saved_at_utc": now_string(),
         }
         try:
             atomic_write_json(STATE_FILE, state)
@@ -125,7 +132,7 @@ async def set_voice_channel_status(channel_id, status):
     url = f"https://discord.com/api/v10/channels/{channel_id}/voice-status"
     headers = {
         "Authorization": f"Bot {TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
     payload = {"status": status}
 
@@ -158,60 +165,107 @@ def format_uptime(seconds):
     return f"{days}d {hours}h {minutes}m {seconds}s"
 
 
+def first_non_bot_member(channel):
+    for member in channel.members:
+        if not member.bot:
+            return member
+    return None
+
+
 async def restore_temporary_channels():
-    """Restore temp channel ownership after Railway restarts/redeploys.
+    """Rebuild temporary channel ownership after Railway restarts/redeploys.
 
-    If a persisted temp channel still exists and has members, ownership is kept.
-    If a category contains old temp channels that were not in the persisted state, ownership is assigned to
-    the first non-bot member so lock/unlock/limit still work after a redeploy.
-    Empty temp channels are cleaned up.
+    Railway memory is wiped on redeploy, so the bot cannot rely only on the in-memory
+    temporary_channels dict. This function uses a hybrid recovery strategy:
+
+    1. Load saved state from elysian_state.json if it exists for this runtime.
+    2. Scan Discord's Form a Party category for existing temp voice channels.
+    3. Ignore the configured New Party join channel.
+    4. Restore known channels from saved state when possible.
+    5. Adopt active unknown temp channels by assigning the first non-bot member as owner.
+    6. Delete empty orphan temp channels so the category stays clean.
     """
-    await load_state()
-    config = await load_config()
-    restored = 0
-    adopted = 0
-    deleted = 0
+    global temporary_channels
 
-    for guild in bot.guilds:
-        guild_config = config.get(str(guild.id))
-        if not guild_config:
-            continue
+    async with restore_lock:
+        await load_state()
+        config = await load_config()
 
-        category = guild.get_channel(guild_config.get("category_id"))
-        join_channel_id = guild_config.get("join_channel_id")
-        if not category:
-            continue
+        restored = 0
+        adopted = 0
+        deleted = 0
+        missing_removed = 0
 
-        for channel in list(category.voice_channels):
-            if channel.id == join_channel_id:
+        valid_channel_ids = set()
+
+        for guild in bot.guilds:
+            guild_config = config.get(str(guild.id))
+            if not guild_config:
                 continue
 
-            non_bot_members = [member for member in channel.members if not member.bot]
+            category_id = guild_config.get("category_id")
+            join_channel_id = guild_config.get("join_channel_id")
+            category = guild.get_channel(category_id)
 
-            if channel.id in temporary_channels:
-                if non_bot_members:
-                    restored += 1
-                else:
-                    temporary_channels.pop(channel.id, None)
+            if not category or not hasattr(category, "voice_channels"):
+                add_error(f"Configured category not found in guild {guild.name}. Run /setup again.")
+                continue
+
+            for channel in list(category.voice_channels):
+                if channel.id == join_channel_id or channel.name == JOIN_CHANNEL_NAME:
+                    continue
+
+                owner_member = first_non_bot_member(channel)
+
+                # Existing known temp channel from saved runtime state.
+                if channel.id in temporary_channels:
+                    if owner_member:
+                        # Keep saved owner if possible, but repair bad/old owners.
+                        saved_owner_id = temporary_channels.get(channel.id)
+                        saved_owner = guild.get_member(saved_owner_id)
+                        if saved_owner is None:
+                            temporary_channels[channel.id] = owner_member.id
+                        valid_channel_ids.add(channel.id)
+                        restored += 1
+                    else:
+                        temporary_channels.pop(channel.id, None)
+                        if CLEAN_EMPTY_TEMP_CHANNELS_ON_STARTUP:
+                            try:
+                                await channel.delete(reason="Cleaning up empty temporary channel after restart")
+                                deleted += 1
+                            except Exception as e:
+                                add_error(e)
+                    continue
+
+                # Unknown channel in Form a Party category after restart.
+                # If occupied, adopt it so commands like /lock, /unlock, and /limit still work.
+                if owner_member:
+                    temporary_channels[channel.id] = owner_member.id
+                    valid_channel_ids.add(channel.id)
+                    adopted += 1
+                    continue
+
+                # Unknown and empty means it is likely an orphan temp channel.
+                if CLEAN_EMPTY_TEMP_CHANNELS_ON_STARTUP:
                     try:
-                        await channel.delete(reason="Cleaning up empty temporary channel after restart")
+                        await channel.delete(reason="Cleaning up orphaned empty temporary channel after restart")
                         deleted += 1
                     except Exception as e:
                         add_error(e)
-                continue
 
-            if non_bot_members:
-                temporary_channels[channel.id] = non_bot_members[0].id
-                adopted += 1
-            else:
-                try:
-                    await channel.delete(reason="Cleaning up orphaned empty temporary channel after restart")
-                    deleted += 1
-                except Exception as e:
-                    add_error(e)
+        # Remove saved channels that no longer exist in Discord.
+        all_discord_channel_ids = {channel.id for guild in bot.guilds for channel in guild.channels}
+        for channel_id in list(temporary_channels.keys()):
+            if channel_id not in all_discord_channel_ids:
+                temporary_channels.pop(channel_id, None)
+                missing_removed += 1
 
-    await save_state()
-    add_event(f"Restored temp channels after startup. Restored: {restored}, adopted: {adopted}, deleted: {deleted}")
+        await save_state()
+        add_event(
+            "Restored temp channels after startup. "
+            f"Restored: {restored}, adopted: {adopted}, deleted: {deleted}, "
+            f"missing_removed: {missing_removed}"
+        )
 
 
 def authorized(request):
@@ -222,17 +276,15 @@ def authorized(request):
 
 
 def rate_limited(request, limit=60):
-    # Lightweight local protection: 60 stats requests per minute per IP.
     ip = request.remote or "unknown"
     minute_key = utc_now().strftime("%Y%m%d%H%M")
     key = f"{ip}:{minute_key}"
     rate_limit_hits[key] = rate_limit_hits.get(key, 0) + 1
 
-    # Clear old keys occasionally.
     if len(rate_limit_hits) > 500:
-        current_prefix = utc_now().strftime("%Y%m%d%H")
+        current_hour = utc_now().strftime("%Y%m%d%H")
         for old_key in list(rate_limit_hits.keys()):
-            if current_prefix not in old_key:
+            if current_hour not in old_key:
                 rate_limit_hits.pop(old_key, None)
 
     return rate_limit_hits[key] > limit
@@ -257,12 +309,13 @@ async def stats_handler(request):
         "uptime_seconds": uptime_seconds,
         "servers": len(bot.guilds),
         "active_temp_channels": len(temporary_channels),
+        "tracked_temp_channels": temporary_channels,
         "total_temp_channels_created": total_temp_channels_created,
         "recent_errors": recent_errors,
         "recent_events": recent_events,
         "timestamp_eastern": utc_now()
-            .astimezone(pytz.timezone("US/Eastern"))
-            .strftime("%m/%d/%Y %I:%M:%S %p %Z")
+        .astimezone(pytz.timezone("US/Eastern"))
+        .strftime("%m/%d/%Y %I:%M:%S %p %Z"),
     }
 
     stats_cache["time"] = now_ts
@@ -275,7 +328,7 @@ async def health_handler(request):
         "status": "ok",
         "bot_ready": bot.is_ready(),
         "port": PORT,
-        "active_temp_channels": len(temporary_channels)
+        "active_temp_channels": len(temporary_channels),
     })
 
 
@@ -300,6 +353,8 @@ async def on_ready():
         await start_stats_server()
         stats_server_started = True
 
+    # Small delay gives Discord's voice-state cache a moment to populate after reconnect.
+    await asyncio.sleep(2)
     await restore_temporary_channels()
     await bot.tree.sync()
 
@@ -316,6 +371,8 @@ async def on_disconnect():
 @bot.event
 async def on_resumed():
     add_event("Bot connection resumed")
+    await asyncio.sleep(2)
+    await restore_temporary_channels()
 
 
 @bot.tree.command(name="setup", description="Create the Form a Party temp voice setup")
@@ -323,7 +380,7 @@ async def setup(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_channels:
         await interaction.response.send_message(
             "You need Manage Channels permission to use this command.",
-            ephemeral=True
+            ephemeral=True,
         )
         return
 
@@ -338,20 +395,22 @@ async def setup(interaction: discord.Interaction):
     if join_channel is None:
         join_channel = await guild.create_voice_channel(
             name=JOIN_CHANNEL_NAME,
-            category=category
+            category=category,
+            reason="Form a Party setup join channel created",
         )
 
     config = await load_config()
     config[str(guild.id)] = {
         "category_id": category.id,
-        "join_channel_id": join_channel.id
+        "join_channel_id": join_channel.id,
     }
     await save_config(config)
+    await restore_temporary_channels()
     add_event(f"/setup completed in {guild.name}")
 
     await interaction.response.send_message(
         f"Setup complete. Created **{CATEGORY_NAME}** with **{JOIN_CHANNEL_NAME}**.",
-        ephemeral=True
+        ephemeral=True,
     )
 
 
@@ -360,7 +419,7 @@ async def lock(interaction: discord.Interaction):
     if not user_owns_channel(interaction):
         await interaction.response.send_message(
             "You can only lock a temporary voice channel that you created.",
-            ephemeral=True
+            ephemeral=True,
         )
         return
 
@@ -379,7 +438,7 @@ async def unlock(interaction: discord.Interaction):
     if not user_owns_channel(interaction):
         await interaction.response.send_message(
             "You can only unlock a temporary voice channel that you created.",
-            ephemeral=True
+            ephemeral=True,
         )
         return
 
@@ -398,14 +457,14 @@ async def limit(interaction: discord.Interaction, amount: int):
     if not user_owns_channel(interaction):
         await interaction.response.send_message(
             "You can only set the limit for a temporary voice channel that you created.",
-            ephemeral=True
+            ephemeral=True,
         )
         return
 
     if amount < 0 or amount > 99:
         await interaction.response.send_message(
             "Please choose a number between 0 and 99. Use 0 for no limit.",
-            ephemeral=True
+            ephemeral=True,
         )
         return
 
@@ -417,7 +476,7 @@ async def limit(interaction: discord.Interaction, amount: int):
 
     await interaction.response.send_message(
         f"User limit for **{channel.name}** set to **{limit_text}**.",
-        ephemeral=True
+        ephemeral=True,
     )
 
 
@@ -438,8 +497,12 @@ async def on_voice_state_update(member, before, after):
         join_channel_id = guild_config.get("join_channel_id")
         category_id = guild_config.get("category_id")
 
+        # User joined the New Party channel, so create their temp channel.
         if after.channel and after.channel.id == join_channel_id:
             category = member.guild.get_channel(category_id)
+            if category is None:
+                add_error(f"Category ID {category_id} not found. Run /setup again.")
+                return
 
             eastern = pytz.timezone("US/Eastern")
             timestamp = utc_now().astimezone(eastern).strftime("%I:%M %p %Z")
@@ -447,7 +510,7 @@ async def on_voice_state_update(member, before, after):
             new_channel = await member.guild.create_voice_channel(
                 name=member.display_name,
                 category=category,
-                reason="Temporary party channel created"
+                reason="Temporary party channel created",
             )
 
             temporary_channels[new_channel.id] = member.id
@@ -458,8 +521,9 @@ async def on_voice_state_update(member, before, after):
             await member.move_to(new_channel)
             add_event(f"Created temp channel {new_channel.name} for {member}")
 
+        # A tracked temp channel became empty, so delete it.
         if before.channel and before.channel.id in temporary_channels:
-            if len(before.channel.members) == 0:
+            if len([m for m in before.channel.members if not m.bot]) == 0:
                 old_name = before.channel.name
                 temporary_channels.pop(before.channel.id, None)
                 await save_state()
