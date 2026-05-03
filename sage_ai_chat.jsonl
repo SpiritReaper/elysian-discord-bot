@@ -23,3 +23,6 @@
 {"time": "06:39:31", "speaker": "SageAI", "message": "I detected an issue. Risk: Needs Review. Suggested fix: Watch for a reconnect or resumed event. If it does not recover check Railway logs and redeploy."}
 {"time": "06:40:04", "speaker": "SageAI", "message": "I detected an issue. Risk: Needs Review. Suggested fix: Watch for a reconnect or resumed event. If it does not recover check Railway logs and redeploy."}
 {"time": "06:40:35", "speaker": "SageAI", "message": "I detected an issue. Risk: Needs Review. Suggested fix: Watch for a reconnect or resumed event. If it does not recover check Railway logs and redeploy."}
+{"time": "06:41:09", "speaker": "SageAI", "message": "I detected an issue. Risk: Needs Review. Suggested fix: Watch for a reconnect or resumed event. If it does not recover check Railway logs and redeploy."}
+{"time": "06:41:44", "speaker": "SageAI", "message": "I detected an issue. Risk: Needs Review. Suggested fix: Watch for a reconnect or resumed event. If it does not recover check Railway logs and redeploy."}
+{"time": "06:42:29", "speaker": "SageAI", "message": "I detected an issue. Risk: Restarted. Suggested fix: Confirm the bot recovered temp channels. If temp channels act wrong run /setup or check restore events."}
