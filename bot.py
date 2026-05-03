@@ -16,6 +16,10 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 STATS_API_KEY = os.getenv("STATS_API_KEY", "")
 PORT = int(os.environ.get("PORT", 8080))
 
+# Sage WinUI uses this key to authenticate with /stats.
+# /health stays public so Sage can quickly verify that Railway is reachable.
+STATS_AUTH_ENABLED = bool(STATS_API_KEY)
+
 CONFIG_FILE = os.getenv("CONFIG_FILE", "config.json")
 STATE_FILE = os.getenv("STATE_FILE", "elysian_state.json")
 
@@ -351,11 +355,17 @@ async def stats_handler(request):
 
     uptime_seconds = int((utc_now() - bot_start_time).total_seconds())
     data = {
+        "status": "ok",
         "bot_online": bot.is_ready(),
+        "bot_ready": bot.is_ready(),
         "bot_name": str(bot.user) if bot.user else None,
         "uptime": format_uptime(uptime_seconds),
         "uptime_seconds": uptime_seconds,
+
+        # Sage WinUI reads server_count. Keep servers too for old launcher compatibility.
+        "server_count": len(bot.guilds),
         "servers": len(bot.guilds),
+
         "active_temp_channels": len(temporary_channels),
         "tracked_temp_channels": temporary_channels,
         "total_temp_channels_created": total_temp_channels_created,
@@ -372,9 +382,15 @@ async def stats_handler(request):
 
 
 async def health_handler(request):
+    uptime_seconds = int((utc_now() - bot_start_time).total_seconds())
+
     return web.json_response({
         "status": "ok",
+        "bot_online": bot.is_ready(),
         "bot_ready": bot.is_ready(),
+        "bot_name": str(bot.user) if bot.user else None,
+        "uptime": format_uptime(uptime_seconds),
+        "uptime_seconds": uptime_seconds,
         "port": PORT,
         "active_temp_channels": len(temporary_channels),
     })
@@ -391,6 +407,8 @@ async def start_stats_server():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     print(f"Stats server running on 0.0.0.0:{PORT}")
+    print(f"Sage /health endpoint ready on port {PORT}")
+    print(f"Sage /stats endpoint auth enabled: {STATS_AUTH_ENABLED}")
 
 
 @bot.event
